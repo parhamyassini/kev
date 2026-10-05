@@ -9,7 +9,8 @@ comparison). KEV_PREFIX_CACHE / KEV_PREFIX_MIN_TOKENS / KEV_PREFIX_MAX_TOKENS si
 date preprocessing (api.with_date_facts). A state over kev.model.SERVE_MAX_STATE tokens is refused with a 422 (kev.model.admit);
 KEV_TRUNCATE_STATES=1 reads its first SERVE_MAX_STATE tokens instead, and then every response says whether it did. Backend
 and precision follow LoadOptions (KEV_BACKEND, KEV_DTYPE, ...): on Apple Silicon the hybrid Qwen3.5 checkpoints run on MLX
-by default, elsewhere on torch in bf16.
+by default, elsewhere on torch in bf16. On an Ascend NPU pass --device npu (kev.npu_qwen35: fused layers and captured
+graphs by default, no state-prefix cache; docs/ascend-npu.md).
 """
 import argparse, asyncio, atexit, hmac, os, queue, random, sys, threading, time, traceback, uuid
 from concurrent.futures import Future
@@ -110,7 +111,10 @@ class Server:
 
     def __post_init__(self):
         self.release_date = self.release_date or self.checkpoint.release_date()
-        self.prefix_cache = PrefixCache(PREFIX_CACHE_SIZE, int(PREFIX_MIN_TOKENS) if PREFIX_MIN_TOKENS else self.model.prefix_min_tokens)
+        # NPU: a cached DeltaNet state continues through the recurrent kernel, not the prefill kernel kev.npu_qwen35
+        # patches (transformers 5.5.4). DecisionModel recomputes those rows, so the cache would only add bookkeeping.
+        cache_size = 0 if str(self.device).startswith("npu") else PREFIX_CACHE_SIZE
+        self.prefix_cache = PrefixCache(cache_size, int(PREFIX_MIN_TOKENS) if PREFIX_MIN_TOKENS else self.model.prefix_min_tokens)
         self.queue, self.stopping = queue.Queue(), threading.Event()
         # the model thread gives up the GIL at every CUDA sync and waits to get it back while the event loop parses and
         # answers requests; at Python's default 5 ms switch interval those waits stretched a batch's model time ~2x.
@@ -329,6 +333,8 @@ def main():
     if dev != "cpu" and opts.dtype is None: opts = replace(opts, dtype=torch.bfloat16)   # serving default: 2-4.5x faster than fp32 on an L4, same answers (LoadOptions.dtype); KEV_DTYPE=fp32 for the exact path
     cuda_optimizations = dev == "cuda" and torch.version.hip is None   # these serving paths are measured on NVIDIA
     if cuda_optimizations and opts.cuda_graphs is None: opts = replace(opts, cuda_graphs=True)   # serving default: a pass is ~2,000 kernel launches, so replaying graphs cuts warm latency several-fold (kev.cuda_graphs); KEV_CUDA_GRAPHS=0 to decline
+    if dev == "npu" and opts.fused is None:
+        opts = replace(opts, fused=True)   # serving default: the fused Ascend layers and captured graphs (kev.npu_qwen35), 3x lower latency on a 910B2; KEV_FUSED=0 to decline
     fused_default = cuda_optimizations and opts.fused is None
     if fused_default: opts = replace(opts, fused=fused_available())   # serving default: fused Qwen3.5 kernels, ~1/3 less GPU time per batch (kev.fused_qwen35), when fla is installed; KEV_FUSED=0 to decline, KEV_FUSED=1 to insist
     if opts.backend is None: opts = replace(opts, backend="auto")   # serving default: MLX for the hybrid Qwen3.5 checkpoints on Apple Silicon (LoadOptions.backend); KEV_BACKEND=torch to decline

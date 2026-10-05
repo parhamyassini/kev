@@ -36,7 +36,7 @@ def test_selection_uses_fresh_interpreter_and_requested_precision(monkeypatch, r
                                      subprocess.CalledProcessError(1, "probe", stderr=" \n"),
                                      subprocess.CalledProcessError(-11, "probe"), subprocess.TimeoutExpired("probe", 30),
                                      OSError("cannot launch interpreter")])
-@pytest.mark.parametrize("requested", ["auto", "cuda", "mps"])
+@pytest.mark.parametrize("requested", ["auto", "cuda", "mps", "npu"])
 def test_failed_probe_falls_back_only_for_auto(monkeypatch, failure, requested):
     def run(*args, **kwargs):
         raise failure
@@ -54,7 +54,7 @@ def test_invalid_probe_output_is_not_a_device(monkeypatch):
     with pytest.warns(RuntimeWarning, match="unexpected probe result"):
         assert device.select() == "cpu"
     with pytest.raises(ValueError, match="unsupported device"):
-        device.select("npu")
+        device.select("tpu")
 
 
 @pytest.mark.parametrize("cuda,mps,resolved", [(True, True, "cuda"), (False, True, "mps"), (False, False, "cpu")])
@@ -193,3 +193,69 @@ def test_serve_cpu_honors_bf16_environment_without_probe(startup, monkeypatch):
     serve.main()
     assert startup[0][0] == "cpu"
     assert startup[0][1].dtype == torch.bfloat16
+
+
+@pytest.fixture
+def torch_npu_import(tmp_path, monkeypatch):
+    """A torch_npu stand-in first on sys.path -> whether this process has imported it (the real one, if any, comes back)."""
+    (tmp_path / "torch_npu.py").write_text("STAND_IN = True\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    real = sys.modules.pop("torch_npu", None)
+    yield lambda: getattr(sys.modules.get("torch_npu"), "STAND_IN", False)
+    sys.modules.pop("torch_npu", None)
+    if real is not None:
+        sys.modules["torch_npu"] = real
+
+
+def test_npu_is_probed_in_a_child_before_this_process_imports_torch_npu(monkeypatch, torch_npu_import):
+    """Auto never discovers an Ascend card. Asked for by name, the child probes it first, where a broken runtime dies,
+    and only then does this process import torch_npu, which must precede any .to("npu")."""
+    def run(command, **kwargs):
+        assert command[-2:] == ["npu", "bfloat16"]
+        assert not torch_npu_import(), "torch_npu must not load here before the probe passes"
+        return SimpleNamespace(stdout="npu\n")
+    monkeypatch.setattr(subprocess, "run", run)
+    assert device.select("npu", dtype=torch.bfloat16) == "npu"
+    assert torch_npu_import()
+
+
+def test_failed_npu_probe_leaves_this_process_without_torch_npu(monkeypatch, torch_npu_import):
+    def run(*args, **kwargs):
+        raise subprocess.CalledProcessError(-11, "probe")
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="--device cpu"):
+        device.select("npu")
+    assert not torch_npu_import()
+
+
+def test_probe_imports_torch_npu_then_multiplies_on_that_card(monkeypatch, torch_npu_import):
+    calls = []
+    class Matrix:
+        def __matmul__(self, other):
+            calls.append("matmul")
+            return self
+    monkeypatch.setattr(torch, "ones", lambda *shape, **kwargs: calls.append(kwargs["device"]) or Matrix())
+    monkeypatch.setattr(device, "sync", lambda dev: calls.append(("sync", dev)))
+    assert device._probe("npu", torch.bfloat16) == "npu"
+    assert torch_npu_import() and calls == ["npu", "matmul", ("sync", "npu")]
+
+
+def test_serve_main_on_an_npu_fuses_by_default_without_the_cuda_paths(startup, monkeypatch, torch_npu_import):
+    sys.argv += ["--device", "npu"]
+    monkeypatch.setattr(subprocess, "run", lambda command, **kwargs: SimpleNamespace(stdout=command[-2]))
+    serve.main()
+    dev, opts = startup[0]
+    assert dev == "npu" and opts.dtype == torch.bfloat16
+    assert opts.fused is True and opts.cuda_graphs is None
+
+
+@pytest.mark.parametrize("module", ["kev.benchmark", "kev.experiment"])
+def test_cli_help_resolves_no_device(monkeypatch, module):
+    """--device defaults to auto and is resolved after parsing, so --help never launches a probe."""
+    import importlib
+    main = importlib.import_module(module).main
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("parsing arguments must not probe"))
+    monkeypatch.setattr(sys, "argv", [module, "--help"])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 0

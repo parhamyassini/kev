@@ -28,7 +28,7 @@ import torch
 
 from kev.benchmark import evaluate_records
 from kev.checkpoint import LoadOptions
-from kev.device import default_device, empty_cache
+from kev.device import empty_cache, select
 from kev.full_ft import snapshot_fractions, too_many_snapshots
 from kev.metrics import fit_temperature, paired_bootstrap
 from kev.model import MAX_STATE, MAX_TRAIN_STATE
@@ -433,7 +433,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--existing", nargs="*", default=[])
     ap.add_argument("--wait-pid", type=int)
-    ap.add_argument("--device", choices=["cpu", "mps", "cuda"], default=default_device())
+    ap.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto", help="auto probes in a child process after parsing")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--aggregate", action="store_true", help="rank an existing study directory (e.g. after Modal trials)")
     ap.add_argument("--transfer", help="eval-only suite whose development partition is scored for every trial (out-of-domain check)")
@@ -442,6 +442,7 @@ def main():
     a = ap.parse_args()
     if a.aggregate:
         aggregate(a.out); return
+    a.device = select(a.device)
     if a.resume:
         if not a.suite: ap.error("--suite is required with --resume")
         suite = Path(a.suite).resolve()

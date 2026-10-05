@@ -15,12 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from kev.api import question_keys, with_date_facts
 from kev.checkpoint import LoadOptions
 from kev.contrastive import paired_flip
 from kev.data import api_request, load_records
-from kev.device import default_device
+from kev.device import DEVICES, select
 from kev.metrics import EPSILON, grouped_metrics, metrics, unknowable_report
 from kev.model import ROW_PASS_TOKENS, ContextOverflow
 from kev.predictors import LocalPredictor, RemotePredictor, RotationAveraged
@@ -177,7 +178,7 @@ def main():
     ap.add_argument("--suite", help="frozen suite directory (scores its development partition)")
     ap.add_argument("--data", help="your own labelled requests, one JSON object per line (kev.data.load_records); an alternative to --suite")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--device", choices=["cpu", "mps", "cuda"], default=default_device())
+    ap.add_argument("--device", choices=("auto", *DEVICES), default="auto", help="auto probes in a child process after parsing; cpu never probes")
     ap.add_argument("--allow-test", action="store_true")
     ap.add_argument("--split", choices=["development", "calibration", "train"], default="development",
                     help="suite partition to score (train: teacher predictions for distillation; --allow-test reads the locked test instead)")
@@ -199,7 +200,12 @@ def main():
         context, skip_overlong = manifest.get("context", CONTEXT), bool(manifest.get("eval_only"))
     if a.date_facts:
         records = [{**r, "state": with_date_facts(r["state"])} for r in records]
-    predictor = RemotePredictor(a.remote, a.remote_model, os.environ.get("KEV_REMOTE_API_KEY", "local"), concurrency=a.remote_concurrency) if a.remote else LocalPredictor(a.run, a.device, LoadOptions.from_env(), context=context)
+    if a.remote:
+        predictor = RemotePredictor(a.remote, a.remote_model, os.environ.get("KEV_REMOTE_API_KEY", "local"), concurrency=a.remote_concurrency)
+    else:
+        opts = LoadOptions.from_env()
+        device = select(a.device, dtype=opts.dtype or torch.float32)   # after parsing, so --help and --remote never probe
+        predictor = LocalPredictor(a.run, device, opts, context=context)
     scorer = RotationAveraged(predictor, a.rotations) if a.rotations > 1 else predictor
     report, _ = evaluate_records(records, scorer, a.out, heldout_sources=tuple(heldout), skip_overlong=skip_overlong)
     report.update(suite_sha256=source_hash, data=a.data, date_facts=a.date_facts, rotations=a.rotations, run=a.run or a.remote, split=split,
