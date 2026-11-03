@@ -219,27 +219,55 @@ def gated_norm(out, z, gamma, eps):
 
 
 def deltanet_forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
-    """Qwen3_5GatedDeltaNet.forward with one projection GEMM and fused norms. No cache: on Ascend a pass never continues
-    a cached DeltaNet state (kev.model.DecisionModel.probs_and_prefix recomputes the rows instead)."""
-    if cache_params is not None:
+    """Qwen3_5GatedDeltaNet.forward with one projection GEMM and fused norms. Supports `Prefix`: a state pass saves the
+    last `conv_kernel_size - 1` pre-conv inputs and the final recurrent state; a branch pass continues from them."""
+    if cache_params is not None and not isinstance(cache_params, Prefix):
         raise NotImplementedError("the fused Ascend layers do not keep a DeltaNet cache; load with fused=False (KEV_FUSED=0)")
-    from transformers.models.qwen3_5.modeling_qwen3_5 import apply_mask_to_padding_states
-    hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+    if attention_mask is not None:
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(hidden_states.dtype)
     B, T, _ = hidden_states.shape
     mixed, z, b, a = F.linear(hidden_states, self.in_proj).split(self.splits, -1)
-    mixed = F.silu(self.conv1d(mixed.transpose(1, 2))[:, :, :T]).transpose(1, 2)
+    x = mixed.transpose(1, 2)
+    mode = getattr(cache_params, "mode", None)
+    if mode == "branch":
+        conv_state, initial_state = cache_params.linear[self.layer_idx]
+        x = torch.cat([conv_state.expand(B, -1, -1), x], -1)
+        mixed = F.silu(F.conv1d(x, self.conv1d.weight, self.conv1d.bias, groups=self.conv_dim)).transpose(1, 2)
+        initial_state = initial_state.expand(B, -1, -1, -1)
+    else:
+        if mode == "state":
+            K = self.conv_kernel_size - 1
+            padded = F.pad(x, (K, 0))
+            if attention_mask is None:
+                conv_state = padded[:, :, -K:]
+            else:
+                idx = attention_mask.sum(-1)[:, None, None] + torch.arange(K, device=x.device)
+                conv_state = padded.gather(2, idx.expand(B, self.conv_dim, K))
+        mixed = F.silu(self.conv1d(x)[:, :, :T]).transpose(1, 2)
+        initial_state = None
+    if mode == "state" and attention_mask is not None:
+        mixed = (mixed * attention_mask[:, :, None]).to(mixed.dtype)
     q, k, v = mixed.split([self.key_dim, self.key_dim, self.value_dim], -1)
     q = q.reshape(B, T, -1, self.head_k_dim)
     k = k.reshape(B, T, -1, self.head_k_dim)
     v = v.reshape(B, T, -1, self.head_v_dim)
     beta = b.sigmoid()
     g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    if mode == "state" and attention_mask is not None:
+        g = g * attention_mask[:, :, None]
     repeat = self.num_v_heads // self.num_k_heads
     if repeat > 1:
         q = q.repeat_interleave(repeat, 2)
         k = k.repeat_interleave(repeat, 2)
-    out, _ = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=None, output_final_state=False,
-                                    use_qk_l2norm_in_kernel=True)
+    out, final_state = chunk_gated_delta_rule(q, k, v, g=g, beta=beta, initial_state=initial_state,
+                                              output_final_state=(mode == "state"), use_qk_l2norm_in_kernel=True)
+    if mode == "state":
+        if self.layer_idx in cache_params.linear:
+            dst_conv, dst_rec = cache_params.linear[self.layer_idx]
+            dst_conv.copy_(conv_state)
+            dst_rec.copy_(final_state)
+        else:
+            cache_params.linear[self.layer_idx] = (conv_state, final_state)
     out = gated_norm(out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim), self.norm.gamma,
                      self.norm.variance_epsilon)
     return self.out_proj(out.reshape(B, T, -1))
@@ -249,7 +277,7 @@ def attention_forward(self, hidden_states, position_embeddings, attention_mask=N
     """Qwen3_5Attention.forward with one projection GEMM, fused q/k norms, fused rotary and the Ascend attention. Rows
     stay in [batch, tokens, heads, dim] from the projection to the output, which is the layout both fused ops take."""
     import torch_npu
-    if past_key_values is not None:
+    if past_key_values is not None and not isinstance(past_key_values, Prefix):
         raise NotImplementedError("the fused Ascend layers do not keep an attention cache; load with fused=False (KEV_FUSED=0)")
     shape = hidden_states.shape[:-1]
     q_gate, k, v = F.linear(hidden_states, self.qkv).split(self.splits, -1)
@@ -258,11 +286,28 @@ def attention_forward(self, hidden_states, position_embeddings, attention_mask=N
     q = rotary(torch_npu.npu_rms_norm(q.contiguous(), self.q_norm.gamma, self.q_norm.eps)[0], cos, sin)
     k = rotary(torch_npu.npu_rms_norm(k.reshape(*shape, -1, self.head_dim), self.k_norm.gamma, self.k_norm.eps)[0], cos, sin)
     v = v.reshape(*shape, -1, self.head_dim)
-    # the inference attention, not npu_fusion_attention: the training op draws a dropout seed on the host, which an
-    # Ascend graph capture refuses (the two agree to 1e-3, bf16 rounding)
-    out = torch_npu.npu_fused_infer_attention_score(
-        q, k, v, num_heads=self.config.num_attention_heads, num_key_value_heads=self.config.num_key_value_heads,
-        input_layout="BSND", atten_mask=_causal(q.device), scale=self.scaling, sparse_mode=3, next_tokens=0)[0]
+    mode = getattr(past_key_values, "mode", None)
+    if mode == "state":
+        if self.layer_idx in past_key_values.kv:
+            dst_k, dst_v = past_key_values.kv[self.layer_idx]
+            dst_k.copy_(k)
+            dst_v.copy_(v)
+        else:
+            past_key_values.kv[self.layer_idx] = (k, v)
+    if mode == "branch":
+        k_state, v_state = past_key_values.kv[self.layer_idx]
+        B = shape[0]
+        k = torch.cat([k_state.expand(B, -1, -1, -1), k], 1)
+        v = torch.cat([v_state.expand(B, -1, -1, -1), v], 1)
+        out = torch_npu.npu_fused_infer_attention_score(
+            q, k, v, num_heads=self.config.num_attention_heads, num_key_value_heads=self.config.num_key_value_heads,
+            input_layout="BSND", atten_mask=past_key_values.attn_mask, scale=self.scaling, sparse_mode=1)[0]
+    else:
+        # the inference attention, not npu_fusion_attention: the training op draws a dropout seed on the host, which an
+        # Ascend graph capture refuses (the two agree to 1e-3, bf16 rounding)
+        out = torch_npu.npu_fused_infer_attention_score(
+            q, k, v, num_heads=self.config.num_attention_heads, num_key_value_heads=self.config.num_key_value_heads,
+            input_layout="BSND", atten_mask=_causal(q.device), scale=self.scaling, sparse_mode=3, next_tokens=0)[0]
     return self.o_proj(out.reshape(*shape, -1) * torch.sigmoid(gate.reshape(*shape, -1))), None
 
 
@@ -281,7 +326,25 @@ def mlp_forward(self, x):
     return self.down_proj(torch_npu.npu_swiglu(F.linear(x, self.gate_up)))
 
 
-def text_pass(lm, inputs_embeds, position_ids, mixer_mask):
+class Prefix:
+    """State prefix for the fused Ascend layers: per linear-attention layer its (conv_state, recurrent_state), per
+    full-attention layer its (k, v), and the real state length `Ls` (plus `state_len` on the device for graph masks)."""
+    layers = ()
+
+    def __init__(self, Ls=0, state_len=None, linear=None, kv=None, bank_id=None, rope_delta=0):
+        self.Ls, self.state_len = Ls, state_len
+        self.linear = {} if linear is None else linear
+        self.kv = {} if kv is None else kv
+        self.bank_id = bank_id
+        self.rope_delta = rope_delta
+        self.mode = "state" if Ls == 0 else "branch"
+        self.attn_mask = None
+
+    def reorder_cache(self, beam_idx):
+        pass
+
+
+def text_pass(lm, inputs_embeds, position_ids, mixer_mask, prefix=None):
     """Embedding to final norm over one padded batch of causal rows: the body a graph captures and the eager pass runs.
     `position_ids` is [rows, tokens] or the reference's 3 or 4 mrope planes."""
     if position_ids.ndim == 2:
@@ -289,10 +352,16 @@ def text_pass(lm, inputs_embeds, position_ids, mixer_mask):
     text_position_ids, position_ids = (position_ids[0], position_ids[1:]) if position_ids.shape[0] == 4 else (None, position_ids)
     hidden_states = inputs_embeds
     position_embeddings = lm.rotary_emb(hidden_states, position_ids)
+    if getattr(prefix, "mode", None) == "branch":
+        Sb = next(iter(prefix.kv.values()))[0].shape[1]
+        Tb = hidden_states.shape[1]
+        ki = torch.arange(Sb + Tb, device=hidden_states.device)
+        qi = torch.arange(Tb, device=hidden_states.device)[:, None]
+        prefix.attn_mask = (((ki >= prefix.state_len) & (ki < Sb)) | (ki > Sb + qi))[None, None].contiguous()
     for layer in lm.layers[: lm.config.num_hidden_layers]:
         hidden_states = layer(hidden_states, position_embeddings=position_embeddings,
                               attention_mask=mixer_mask if _layer_type(layer) == "linear_attention" else None,
-                              position_ids=text_position_ids)
+                              position_ids=text_position_ids, past_key_values=prefix)
     return lm.norm(hidden_states)
 
 
@@ -301,16 +370,39 @@ def text_forward(self, input_ids=None, attention_mask=None, position_ids=None, p
     """Qwen3_5TextModel.forward for Kev's causal rows: no [rows, 1, L, L] float mask (the fused attention reads the
     compressed causal one instead), replayed from a captured graph when one fits the shape."""
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ModelOutputWithPast
-    if past_key_values is not None or use_cache:
-        raise NotImplementedError("the fused Ascend layers keep no cache; load with fused=False (KEV_FUSED=0)")
     if attention_mask is not None and attention_mask.ndim != 2:
         raise NotImplementedError(f"the fused Ascend layers take causal rows with a [rows, tokens] mask, not a "
                                   f"{attention_mask.ndim}D one; load with fused=False (KEV_FUSED=0)")
+    tokens = input_ids if inputs_embeds is None else inputs_embeds   # ids, or embeddings the caller built itself
+    T = tokens.shape[_token_axis(tokens)]
+    if attention_mask is not None and attention_mask.shape[1] > T:
+        attention_mask = attention_mask[:, -T:]                     # _rows_hidden prepends the cached state's 1s
+    if position_ids is None:
+        position_ids = torch.arange(T, device=tokens.device)[None].expand(tokens.shape[0], -1)
+    if past_key_values is not None or use_cache:
+        full_mask = torch.ones((tokens.shape[0], T), dtype=torch.long, device=tokens.device) if attention_mask is None else attention_mask
+        if isinstance(past_key_values, Prefix) and past_key_values.Ls > 0:
+            if self.graphs is not None:
+                hidden = self.graphs.run_branch(tokens, position_ids, full_mask, past_key_values)
+                if hidden is not None:
+                    return Qwen3_5ModelOutputWithPast(last_hidden_state=hidden, past_key_values=past_key_values)
+            if inputs_embeds is None: inputs_embeds = self.embed_tokens(input_ids)
+            mixer_mask = None if attention_mask is None or bool(torch.all(attention_mask == 1)) else attention_mask
+            hidden = text_pass(self, inputs_embeds, position_ids, mixer_mask, prefix=past_key_values)
+            return Qwen3_5ModelOutputWithPast(last_hidden_state=hidden, past_key_values=past_key_values)
+        if self.graphs is not None:
+            got = self.graphs.run_state(tokens, position_ids, full_mask)
+            if got is not None:
+                hidden, prefix = got
+                return Qwen3_5ModelOutputWithPast(last_hidden_state=hidden, past_key_values=prefix)
+        if inputs_embeds is None: inputs_embeds = self.embed_tokens(input_ids)
+        mixer_mask = None if attention_mask is None or bool(torch.all(attention_mask == 1)) else attention_mask
+        prefix = Prefix()
+        hidden = text_pass(self, inputs_embeds, position_ids, mixer_mask, prefix=prefix)
+        prefix.Ls, prefix.state_len, prefix.mode = T, torch.tensor([T], device=tokens.device, dtype=torch.int64), "branch"
+        return Qwen3_5ModelOutputWithPast(last_hidden_state=hidden, past_key_values=prefix)
     # the mixers zero padded tokens; the reference skips that when nothing is padded, and reads the mask to find out
     mixer_mask = None if attention_mask is None or bool(torch.all(attention_mask == 1)) else attention_mask
-    tokens = input_ids if inputs_embeds is None else inputs_embeds   # ids, or embeddings the caller built itself
-    if position_ids is None:
-        position_ids = torch.arange(tokens.shape[1], device=tokens.device)[None].expand(tokens.shape[0], -1)
     if self.graphs is not None:
         hidden = self.graphs.run(tokens, position_ids, mixer_mask)
         if hidden is not None:
@@ -362,6 +454,8 @@ class Graphs:
         self.lm, self.pad_id = lm, pad_id
         self.pool = torch.npu.graph_pool_handle()
         self.entries, self.refused = {}, set()
+        self.bank = None
+        self.bank_id = 0
 
     def fills(self, tokens):
         """What the padded tail of each input holds: pad tokens (or zero embeddings), position 0, masked out."""
@@ -383,6 +477,106 @@ class Graphs:
     def room(self):
         free, _total = torch.npu.mem_get_info()
         return free > GRAPH_MIN_FREE
+
+    def _ensure_bank(self, device):
+        if self.bank is not None: return self.bank
+        Smax = GRAPH_LENGTHS[-1]
+        dtype = next(self.lm.parameters()).dtype
+        linear, kv = {}, {}
+        for i, layer in enumerate(self.lm.layers[: self.lm.config.num_hidden_layers]):
+            if _layer_type(layer) == "linear_attention":
+                m = layer.linear_attn
+                linear[i] = (torch.zeros((1, m.conv_dim, m.conv_kernel_size - 1), dtype=dtype, device=device),
+                             torch.zeros((1, m.num_v_heads, m.head_k_dim, m.head_v_dim), dtype=torch.bfloat16, device=device))
+            else:
+                m = layer.self_attn
+                kv[i] = (torch.zeros((1, Smax, m.config.num_key_value_heads, m.head_dim), dtype=dtype, device=device),
+                         torch.zeros((1, Smax, m.config.num_key_value_heads, m.head_dim), dtype=dtype, device=device))
+        self.bank = (linear, kv, torch.zeros((1,), dtype=torch.int64, device=device))
+        return self.bank
+
+    def _bank_prefix(self, Sb, Ls, mode, device):
+        linear, kv, state_len = self._ensure_bank(device)
+        state_len.fill_(Ls)
+        return Prefix(Ls=Ls if mode == "branch" else 0, state_len=state_len, linear=linear,
+                      kv={i: (k[:, :Sb], v[:, :Sb]) for i, (k, v) in kv.items()}, bank_id=self.bank_id)
+
+    def snapshot_prefix(self, prefix):
+        """Copy the bank's live prefix into standalone tensors so PrefixCache can hold it across later state passes."""
+        if not isinstance(prefix, Prefix) or prefix.bank_id is None: return prefix
+        return Prefix(Ls=prefix.Ls, state_len=prefix.state_len.clone(),
+                      linear={i: (c.clone(), r.clone()) for i, (c, r) in prefix.linear.items()},
+                      kv={i: (k[:, :prefix.Ls].clone(), v[:, :prefix.Ls].clone()) for i, (k, v) in prefix.kv.items()},
+                      bank_id=None, rope_delta=prefix.rope_delta)
+
+    def _load_bank(self, prefix, Sb):
+        device = next(iter(prefix.linear.values()))[0].device
+        linear, kv, state_len = self._ensure_bank(device)
+        if self.bank_id == prefix.bank_id and prefix.bank_id is not None:
+            state_len.fill_(prefix.Ls)
+            return
+        self.bank_id += 1
+        state_len.fill_(prefix.Ls)
+        for i, (c, r) in prefix.linear.items():
+            linear[i][0].copy_(c); linear[i][1].copy_(r)
+        for i, (k, v) in prefix.kv.items():
+            kv[i][0][:, :prefix.Ls].copy_(k[:, :prefix.Ls])
+            kv[i][1][:, :prefix.Ls].copy_(v[:, :prefix.Ls])
+
+    def run_state(self, tokens, pos, mask):
+        """Graphed state pass [1, T] padded to [1, Sb]: writes its prefix into the static bank and returns (hidden, Prefix)."""
+        if tokens.shape[0] != 1: return None
+        Sb = self.bucket(tokens)
+        if Sb is None: return None
+        inputs = (tokens, pos, mask)
+        key = ("state", *self.key(inputs, Sb))
+        if key in self.refused: return None
+        Ls = tokens.shape[_token_axis(tokens)]
+        device = tokens.device
+        self.bank_id += 1
+        prefix = self._bank_prefix(Sb, Ls, "state", device)
+        entry = self.entries.get(key)
+        if entry is None:
+            if len(self.entries) >= MAX_GRAPHS or not self.room(): return None
+            entry = self._capture(key, inputs, Sb, prefix=prefix)
+            if entry is None: return None
+        graph, buffers, out = entry
+        for buffer, value, fill in zip(buffers, inputs, self.fills(tokens)):
+            if buffer is None: continue
+            axis = _token_axis(buffer)
+            buffer[_slice(buffer, axis, 0, value.shape[axis])] = value
+            buffer[_slice(buffer, axis, value.shape[axis])] = fill
+        graph.replay()
+        prefix.Ls, prefix.mode, prefix.bank_id = Ls, "branch", self.bank_id
+        return out.clone(), prefix
+
+    def run_branch(self, tokens, pos, mask, prefix):
+        """Graphed branch pass [B, T] padded to [B, Lb], continuing `prefix` (loaded into the static bank if needed)."""
+        Lb = self.bucket(tokens)
+        Sb = next((n for n in GRAPH_LENGTHS if n >= prefix.Ls), None)
+        if Lb is None or Sb is None: return None
+        inputs = (tokens, pos, mask)
+        key = ("branch", Sb, *self.key(inputs, Lb))
+        if key in self.refused: return None
+        device = tokens.device
+        self._load_bank(prefix, Sb)
+        b_prefix = self._bank_prefix(Sb, prefix.Ls, "branch", device)
+        entry = self.entries.get(key)
+        if entry is None:
+            if len(self.entries) >= MAX_GRAPHS or not self.room(): return None
+            saved = {i: (c.clone(), r.clone()) for i, (c, r) in b_prefix.linear.items()}
+            entry = self._capture(key, inputs, Lb, prefix=b_prefix)
+            for i, (c, r) in saved.items():
+                b_prefix.linear[i][0].copy_(c); b_prefix.linear[i][1].copy_(r)
+            if entry is None: return None
+        graph, buffers, out = entry
+        for buffer, value, fill in zip(buffers, inputs, self.fills(tokens)):
+            if buffer is None: continue
+            axis = _token_axis(buffer)
+            buffer[_slice(buffer, axis, 0, value.shape[axis])] = value
+            buffer[_slice(buffer, axis, value.shape[axis])] = fill
+        graph.replay()
+        return out.clone()
 
     def run(self, tokens, pos, mask):
         """-> hidden states for this pass from a replayed graph, or None to run it eagerly. `tokens` is the row ids, or
@@ -407,6 +601,9 @@ class Graphs:
         return out.clone()   # the graph writes this buffer again on the next replay
 
     def capture(self, key, inputs, length):
+        return self._capture(key, inputs, length, prefix=None)
+
+    def _capture(self, key, inputs, length, prefix=None):
         """Buffers this shape's inputs padded out to its bucket length, then records one pass over them."""
         buffers = []
         for value, fill in zip(inputs, self.fills(inputs[0])):
@@ -424,10 +621,10 @@ class Graphs:
         graph = torch.npu.NPUGraph()
         device = tokens.device
         try:
-            text_pass(self.lm, embed(), pos, mask)   # warm this shape: capture records a pass, it does not run one
+            text_pass(self.lm, embed(), pos, mask, prefix=prefix)   # warm this shape: capture records a pass, it does not run one
             sync(device)
             with torch.npu.graph(graph, pool=self.pool):
-                out = text_pass(self.lm, embed(), pos, mask)
+                out = text_pass(self.lm, embed(), pos, mask, prefix=prefix)
             sync(device)
         except Exception as e:
             sync(device)

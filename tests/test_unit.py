@@ -125,6 +125,55 @@ def test_encode_positions_restart_per_branch(tok):
     assert all(enc["ids"][d] == tok.convert_tokens_to_ids(SPECIAL[4]) for d in enc["decide_idx"])
 
 
+def test_image_block_joins_immediately_after_fim_prefix(tok):
+    """kev.vision splices the picture immediately after <|fim_prefix|> (controller-heads.md / areal splice_vision).
+    The block is state (segment 0), so every question row starts with it, and the <decide> / </opt> indices still
+    point at their delimiters. User text cannot add image slots."""
+    from kev.model import rows_of
+    from kev.vision import splice_image
+    vs, pad, ve = 11, 12, 13
+    rec = {"state": "a photo <|image_pad|><|vision_end|>", "questions": [{"instr": "q1", "options": ["a", "b"], "label": 0},
+                                                                          {"instr": "q2", "options": ["a", "b", "c"], "label": 1}]}
+    enc = encode(tok, rec)
+    assert enc["ids"][0] == tok.convert_tokens_to_ids(SPECIAL[0])
+    assert not {vs, pad, ve} & set(enc["ids"])
+    got = splice_image(enc, 6, vs, pad, ve)
+    assert got["ids"][:1] == [enc["ids"][0]]
+    assert got["ids"][1:9] == [vs] + [pad] * 6 + [ve]
+    assert got["ids"][9:] == enc["ids"][1:]
+    assert len(got["ids"]) == len(got["seg"]) == len(got["pos"]) == len(got["opt"]) and got["seg"].count(0) == enc["seg"].count(0) + 8
+    assert [got["ids"][d] for d in got["decide_idx"]] == [enc["ids"][d] for d in enc["decide_idx"]]
+    assert [[got["ids"][o] for o in oi] for oi in got["opt_idx"]] == [[enc["ids"][o] for o in oi] for oi in enc["opt_idx"]]
+    (S, _, rows), (S0, _, rows0) = rows_of(got), rows_of(enc)
+    assert S == S0[:1] + [vs] + [pad] * 6 + [ve] + S0[1:]
+    assert [(r["ids"], r["decide"], r["opts"]) for r in rows] == [(r["ids"], r["decide"], r["opts"]) for r in rows0]
+
+
+def test_training_shot_image_token_count():
+    """490x504 k4-plan-corpus shots become 240 <|image_pad|> tokens on Qwen3.8-27B (patch 16, merge 2, t=1)."""
+    from kev.vision import TRAIN_IMAGE_PADS, TRAIN_IMAGE_SIZE
+    width, height = TRAIN_IMAGE_SIZE
+    factor = 16 * 2
+    ww, hh = round(width / factor) * factor, round(height / factor) * factor
+    assert (hh // 16) * (ww // 16) // 4 == TRAIN_IMAGE_PADS == 240
+    model = Path("/root/LLMs/Qwen3.8-27B")
+    if not (model / "preprocessor_config.json").is_file():
+        return
+    from PIL import Image
+    from transformers.models.auto.image_processing_auto import AutoImageProcessor
+    proc = AutoImageProcessor.from_pretrained(str(model), backend="pil", local_files_only=True)
+    pix = proc(images=[Image.new("RGB", TRAIN_IMAGE_SIZE, "red")], return_tensors="pt")
+    n = int(pix["image_grid_thw"][0].prod()) // 4
+    assert n == TRAIN_IMAGE_PADS
+    shot_dir = Path("/workspace/agent-sched/GameWorld/timeliness-research/p1-data/k4-plan-corpus/shots")
+    shots = list(shot_dir.glob("*.png")) if shot_dir.is_dir() else []
+    if shots:
+        img = Image.open(shots[0])
+        assert img.size == TRAIN_IMAGE_SIZE
+        n_shot = int(proc(images=[img.convert("RGB")], return_tensors="pt")["image_grid_thw"][0].prod()) // 4
+        assert n_shot == TRAIN_IMAGE_PADS
+
+
 def test_load_records_jsonl(tmp_path):
     """The fine-tuning input format from the README: API-shaped requests with a label per question, one per line."""
     from kev.data import load_records, materialize
@@ -512,8 +561,128 @@ def test_serve_models_card_reports_the_state_limit(tiny_model, monkeypatch):
         with TestClient(serve.app) as client:
             card = client.get("/v1/models").json()["models"][0]
         assert card["max_state_tokens"] == 65536 and card["truncate_states"] is False
+        assert card["images"] is False
     finally:
         s.close()
+
+
+def test_decode_image_accepts_data_urls_and_base64():
+    """decode_image accepts a data URL or bare base64 (whitespace ignored) and applies EXIF orientation."""
+    import base64, io
+    from PIL import Image
+    from kev.vision import decode_image
+    buf = io.BytesIO(); Image.new("RGBA", (40, 30)).save(buf, "PNG"); b64 = base64.b64encode(buf.getvalue()).decode()
+    for value in (f"data:image/png;base64,{b64}", b64, b64[:20] + "\n" + b64[20:]):
+        img = decode_image(value)
+        assert img.mode == "RGB" and img.size == (40, 30)
+    jpeg = Image.new("RGB", (40, 20)); exif = Image.Exif(); exif[0x0112] = 6
+    buf = io.BytesIO(); jpeg.save(buf, "JPEG", exif=exif)
+    assert decode_image(base64.b64encode(buf.getvalue()).decode()).size == (20, 40)
+
+
+def test_decode_image_rejects_bad_input():
+    """Malformed data URLs, bad base64, non-images, animated GIFs and oversize pixels all raise ValueError."""
+    import base64, io
+    from PIL import Image
+    from kev.vision import decode_image
+    frames = [Image.new("RGB", (8, 8), c) for c in ("red", "blue")]
+    gif = io.BytesIO(); frames[0].save(gif, "GIF", save_all=True, append_images=[frames[1]])
+    huge = io.BytesIO(); Image.new("1", (5000, 4000)).save(huge, "PNG")
+    cases = [
+        "data:text/plain;base64,aGVsbG8=",
+        "not base64 !!",
+        base64.b64encode(b"hello world").decode(),
+        base64.b64encode(gif.getvalue()).decode(),
+        base64.b64encode(huge.getvalue()).decode(),
+    ]
+    for value in cases:
+        with pytest.raises(ValueError):
+            decode_image(value)
+
+
+def test_serve_images_need_a_vision_model_and_skip_the_prefix_cache(tok):
+    """Only --vision servers take an image; image requests never use the state-prefix cache."""
+    import base64, io
+    from fastapi import HTTPException
+    from PIL import Image
+    from kev.api import SystemOneRequest
+    from kev.model import probs_one
+    from kev.serve import Server
+
+    buf = io.BytesIO(); Image.new("RGB", (40, 30), "red").save(buf, "PNG")
+    data_url = f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+    body = {"state": "s", "image": data_url, "questions": {"q": {"type": "noul", "instructions": "Is it red?"}}}
+
+    class Stub:
+        accepts_images = False
+        prefix_min_tokens = 0
+        head = SimpleNamespace(temperature=1.0)
+        got_image = "unset"
+        def encode(self, tok, rec, image=None, **kw):
+            self.got_image = image; self._n = len(rec["questions"])
+            enc = {"ids": [1, 2, 3, 4], "seg": [0, 0, 1, 1], "state_tokens": 2}
+            if image is not None: enc["image_grid_thw"] = "image"
+            return enc
+        def probs(self, enc):
+            return [torch.tensor([0.25, 0.75])] * self._n
+        def probs_and_prefix(self, enc):
+            return [torch.tensor([0.25, 0.75])] * self._n, "prefix"
+        def probs_with_prefix(self, enc, prefix):
+            raise AssertionError("image requests must not use the prefix cache")
+        def probs_batch(self, encs, prefixes, keep):
+            out = [probs_one(self, e, p, k) for e, p, k in zip(encs, prefixes, keep)]
+            return [a for a, _ in out], [b for _, b in out]
+
+    def server(model):
+        return Server(SimpleNamespace(release_date=lambda: "2026-01-01"), tok, model, "cpu", release_date="2026-01-01")
+
+    text = server(Stub())
+    try:
+        with pytest.raises(HTTPException) as e:
+            text.answer(SystemOneRequest.model_validate(body))
+        assert e.value.status_code == 422
+    finally:
+        text.close()
+
+    vision = Stub(); vision.accepts_images = True
+    srv = server(vision)
+    try:
+        out = srv.answer(SystemOneRequest.model_validate(body))
+        assert out["answers"]["q"]["noul"] == 0.75
+        assert isinstance(vision.got_image, Image.Image) and vision.got_image.size == (40, 30)
+        assert srv.prefix_cache.entries == {} and srv.prefix_cache.misses == 0
+        with pytest.raises(HTTPException) as e:
+            srv.answer(SystemOneRequest.model_validate({**body, "image": "not base64 !!"}))
+        assert e.value.status_code == 422
+        vision.got_image = "unset"
+        srv.answer(SystemOneRequest.model_validate({"state": "s", "questions": {"q": {"type": "noul", "instructions": "Is it red?"}}}))
+        assert vision.got_image is None
+    finally:
+        srv.close()
+
+
+def test_read_request_inlines_image_files(tmp_path):
+    """read_request inlines a relative image path as base64; an --image path overrides; data URLs stay as-is."""
+    import base64, io, json
+    from PIL import Image
+    from kev.serve import read_request
+    from kev.vision import decode_image
+
+    img_dir = tmp_path / "img"; img_dir.mkdir()
+    a = img_dir / "a.png"; buf = io.BytesIO(); Image.new("RGB", (16, 12), "blue").save(buf, "PNG"); a.write_bytes(buf.getvalue())
+    b = tmp_path / "b.png"; buf = io.BytesIO(); Image.new("RGB", (8, 8), "green").save(buf, "PNG"); b.write_bytes(buf.getvalue())
+    req_path = tmp_path / "req.json"
+    req_path.write_text(json.dumps({"state": "s", "image": "img/a.png", "questions": {"q": {"type": "noul", "instructions": "?"}}}), encoding="utf-8")
+    req = read_request(req_path)
+    assert decode_image(req.image).size == (16, 12)
+    assert decode_image(read_request(req_path, image=str(b)).image).size == (8, 8)
+    data_url = f"data:image/png;base64,{base64.b64encode(a.read_bytes()).decode()}"
+    url_path = tmp_path / "url.json"
+    url_path.write_text(json.dumps({"state": "s", "image": data_url, "questions": {"q": {"type": "noul", "instructions": "?"}}}), encoding="utf-8")
+    assert read_request(url_path).image == data_url
+    none_path = tmp_path / "none.json"
+    none_path.write_text(json.dumps({"state": "s", "questions": {"q": {"type": "noul", "instructions": "?"}}}), encoding="utf-8")
+    assert read_request(none_path).image is None
 
 
 def test_benchmark_refuses_over_length_records(tiny_model, tmp_path):

@@ -44,6 +44,7 @@ class SystemOneRequest(BaseModel):
     state: JSONContent
     model: str = "kev-latest"
     questions: dict[str, Question] = Field(min_length=1)
+    image: str | None = None   # data URL or bare base64; only a --vision server accepts it (kev.vision)
 
 
 def render(v: JSONContent, indent: int = 0) -> str:

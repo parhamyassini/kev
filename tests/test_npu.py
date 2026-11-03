@@ -86,8 +86,8 @@ def test_hybrid_rows_still_use_the_prefix_off_npu():
 
 
 def test_server_keeps_no_prefix_cache_on_npu(monkeypatch):
-    """A cached state would be continued through the recurrent kernel, so the NPU server builds its cache with size 0
-    (and DecisionModel recomputes, see above); every other device keeps the configured size."""
+    """A cached state would be continued through the recurrent kernel, so a text NPU server builds its cache with size 0
+    (and DecisionModel recomputes, see above); a fused NPU vision server caches up to 2 image prefixes keyed by image_digest."""
     from kev import serve
     monkeypatch.setattr(serve, "PREFIX_CACHE_SIZE", 4)
 
@@ -101,6 +101,19 @@ def test_server_keeps_no_prefix_cache_on_npu(monkeypatch):
         finally:
             s.close()
 
+    def fused_fwd(): pass
+    fused_fwd.__module__ = "kev.npu_qwen35"
+    v_model = SimpleNamespace(prefix_min_tokens=0, accepts_images=True, lm=SimpleNamespace(forward=fused_fwd))
+    s = serve.Server(SimpleNamespace(release_date=lambda: "2026-01-01"), None, v_model, "npu:0")
+    try:
+        assert s.prefix_cache.size == 2
+        e1 = {"ids": [1, 2, 3], "seg": [0, 0, 1], "image_grid_thw": "g", "image_digest": "aaa"}
+        e2 = {"ids": [1, 2, 3], "seg": [0, 0, 1], "image_grid_thw": "g", "image_digest": "bbb"}
+        keys, _, _ = s.prefix_cache.plan([e1, e2])
+        assert keys[0] != keys[1] and keys[0] == ((1, 2), False, "aaa")
+    finally:
+        s.close()
+
 
 def ascend(monkeypatch, *, merged=True, hybrid=True):
     """-> (calls, stand-in Checkpoint, tokenizer) for Checkpoint._load_torch with kev.npu_qwen35's entry points recorded,
@@ -108,7 +121,7 @@ def ascend(monkeypatch, *, merged=True, hybrid=True):
     calls = []
     model = SimpleNamespace(hybrid=hybrid, lm="lm", pad_id=7)
 
-    def build(tok, device, opts):
+    def build(tok, device, opts, cls=DecisionModel):
         calls.append("build")
         return model, merged
 
@@ -322,3 +335,54 @@ def test_fused_model_and_its_graphs_match_the_reference(npu):
     assert len(lm.graphs.entries) == 1 and not lm.graphs.refused
     assert torch.equal(replayed, captured)
     assert relative_error(replayed[real], want) < 0.02
+
+
+@torch.no_grad()
+def test_fused_prefix_and_branch_graphs_match_the_reference(npu):
+    """A state pass (left-identifying its real length Ls inside a right-padded graph bucket) followed by a multi-row
+    branch pass (right-padded) equals running the full state+branch rows on the fp32 CPU reference, both eagerly and
+    from captured state/branch graphs, and a snapshotted prefix replays after another state overwrote the bank."""
+    from transformers import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+    cfg = Qwen3_5TextConfig(vocab_size=64, hidden_size=256, intermediate_size=512, num_hidden_layers=2,
+                            num_attention_heads=4, num_key_value_heads=2, head_dim=256, linear_num_value_heads=8,
+                            linear_num_key_heads=4, linear_key_head_dim=128, linear_value_head_dim=128,
+                            layer_types=["linear_attention", "full_attention"], pad_token_id=0)
+    torch.manual_seed(2)
+    ref = Qwen3_5TextModel(cfg).eval()
+    for p in ref.parameters():
+        p.data = p.data.bfloat16()
+    lm = copy.deepcopy(ref).to(npu)
+    ref = ref.float()
+    Ls, Lb, B = 70, 25, 3
+    s_ids = torch.randint(2, 64, (1, Ls))
+    b_ids = torch.randint(2, 64, (B, Lb))
+    b_mask = torch.ones(B, Lb, dtype=torch.long)
+    b_mask[1, 18:] = 0; b_mask[2, 21:] = 0
+    b_ids[b_mask == 0] = 0
+    full_ids = torch.cat([s_ids.expand(B, -1), b_ids], 1)
+    full_mask = torch.cat([torch.ones(B, Ls, dtype=torch.long), b_mask], 1)
+    real = b_mask.bool()
+    want = ref(input_ids=full_ids, attention_mask=full_mask).last_hidden_state[:, Ls:][real]
+
+    s_pos = torch.arange(Ls, device=npu)[None].expand(3, 1, -1)
+    b_pos = torch.arange(Ls, Ls + Lb, device=npu)[None, None].expand(3, B, -1)
+    npu_qwen35.fuse(lm, pad_id=0, graphs=False)
+    prefix = lm(inputs_embeds=lm.embed_tokens(s_ids.to(npu)), position_ids=s_pos, use_cache=True).past_key_values
+    eager = lm(input_ids=b_ids.to(npu), position_ids=b_pos, attention_mask=b_mask.to(npu),
+               past_key_values=prefix, use_cache=True).last_hidden_state.float().cpu()[:, :Lb]
+    assert relative_error(eager[real], want) < 0.02
+
+    lm.graphs = npu_qwen35.Graphs(lm, 0)
+    p1 = lm(inputs_embeds=lm.embed_tokens(s_ids.to(npu)), position_ids=s_pos, use_cache=True).past_key_values
+    snap = lm.graphs.snapshot_prefix(p1)
+    g1 = lm(input_ids=b_ids.to(npu), position_ids=b_pos, attention_mask=b_mask.to(npu),
+            past_key_values=p1, use_cache=True).last_hidden_state.float().cpu()[:, :Lb]
+    # overwrite the bank with another state, then replay from the snapshotted prefix
+    other = torch.randint(2, 64, (1, 90), device=npu)
+    lm(inputs_embeds=lm.embed_tokens(other), position_ids=torch.arange(90, device=npu)[None].expand(3, 1, -1), use_cache=True)
+    g2 = lm(input_ids=b_ids.to(npu), position_ids=b_pos, attention_mask=b_mask.to(npu),
+            past_key_values=snap, use_cache=True).last_hidden_state.float().cpu()[:, :Lb]
+    assert not lm.graphs.refused and len(lm.graphs.entries) == 2
+    assert torch.equal(g1, g2) and relative_error(g1[real], want) < 0.02
+

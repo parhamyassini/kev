@@ -11,8 +11,14 @@ KEV_TRUNCATE_STATES=1 reads its first SERVE_MAX_STATE tokens instead, and then e
 and precision follow LoadOptions (KEV_BACKEND, KEV_DTYPE, ...): on Apple Silicon the hybrid Qwen3.5 checkpoints run on MLX
 by default, elsewhere on torch in bf16. On an Ascend NPU pass --device npu (kev.npu_qwen35: fused layers and captured
 graphs by default, no state-prefix cache; docs/ascend-npu.md).
+
+--vision loads the checkpoint with its base's vision tower (Checkpoint.load_vision, torch only), so a request may carry
+one picture in its `image` field (data URL or base64). --request answers one JSON file and exits instead of serving:
+
+    python -m kev.serve --run jaredpalmer/kev-4b --request req.json --image photo.jpg
 """
-import argparse, asyncio, atexit, hmac, os, queue, random, sys, threading, time, traceback, uuid
+import argparse, asyncio, atexit, base64, hmac, json, os, queue, random, sys, threading, time, traceback, uuid
+from pathlib import Path
 from concurrent.futures import Future
 import torch
 from dataclasses import dataclass, field, replace
@@ -53,8 +59,13 @@ class PrefixCache:
     def plan(self, encs):
         """-> (key per request, None when its state is not cached; its cached prefix or None; whether to keep a new one)."""
         lengths = [enc["seg"].count(0) for enc in encs]
-        keys = [(tuple(enc["ids"][:n]), bool(enc.get("option_isolation"))) if self.size and self.min_tokens <= n <= self.max_tokens else None
-                for enc, n in zip(encs, lengths)]
+        def key_for(enc, n):
+            if not (self.size and self.min_tokens <= n <= self.max_tokens): return None
+            if "image_grid_thw" in enc:
+                digest = enc.get("image_digest")
+                return (tuple(enc["ids"][:n]), bool(enc.get("option_isolation")), digest) if digest else None
+            return (tuple(enc["ids"][:n]), bool(enc.get("option_isolation")))
+        keys = [key_for(enc, n) for enc, n in zip(encs, lengths)]
         survivors, tokens = set(), 0
         for key in dict.fromkeys(k for k in reversed(keys) if k is not None):   # most recent first, as store() keeps them
             if len(survivors) == self.size or tokens + len(key[0]) > self.max_tokens: break
@@ -111,9 +122,10 @@ class Server:
 
     def __post_init__(self):
         self.release_date = self.release_date or self.checkpoint.release_date()
-        # NPU: a cached DeltaNet state continues through the recurrent kernel, not the prefill kernel kev.npu_qwen35
-        # patches (transformers 5.5.4). DecisionModel recomputes those rows, so the cache would only add bookkeeping.
-        cache_size = 0 if str(self.device).startswith("npu") else PREFIX_CACHE_SIZE
+        # NPU: a cached DeltaNet state continues through the recurrent kernel unless kev.npu_qwen35's fused layers
+        # handle it (VisionDecisionModel with fused=True). Text-only NPU servers keep size 0.
+        npu_vision = getattr(self.model, "accepts_images", False) and getattr(getattr(getattr(self.model, "lm", None), "forward", None), "__module__", "") == "kev.npu_qwen35"
+        cache_size = (min(2, PREFIX_CACHE_SIZE) if npu_vision else 0) if str(self.device).startswith("npu") else PREFIX_CACHE_SIZE
         self.prefix_cache = PrefixCache(cache_size, int(PREFIX_MIN_TOKENS) if PREFIX_MIN_TOKENS else self.model.prefix_min_tokens)
         self.queue, self.stopping = queue.Queue(), threading.Event()
         # the model thread gives up the GIL at every CUDA sync and waits to get it back while the event loop parses and
@@ -133,14 +145,15 @@ class Server:
             self.queue.get_nowait()[1].set_exception(RuntimeError("the server stopped")); self.queue.task_done()
         sys.setswitchinterval(self.switch_interval)
 
-    def submit(self, rec):
+    def submit(self, rec, image=None):
         """Queue one record for the model thread. -> a Future of (probabilities, stats). The state prefix (tokens up to the
         first question) is cached across requests, so a repeated state only pays for its question rows. latency_ms is the
         model time of the batch the request ran in (not its wait in the queue). A record kev.model.admit refuses (a state
         over SERVE_MAX_STATE tokens unless truncate_states, a question row over SERVE_MAX_BRANCH) is a 422 here, before
-        it reaches the model."""
+        it reaches the model. A picture is encoded into the record and is never a cache key (PrefixCache.plan): the same
+        <image_pad> ids would collide across pictures."""
         if self.stopping.is_set(): raise HTTPException(503, "the server is stopping")
-        try: enc = admit(self.model, self.tok, rec, truncate=self.truncate_states)
+        try: enc = admit(self.model, self.tok, rec, truncate=self.truncate_states, image=image)
         except ValueError as e:   # ContextOverflow, or a record the encoder cannot take
             state = isinstance(e, ContextOverflow) and e.max_state is not None
             raise HTTPException(422, str(e) + (f"; or start the server with KEV_TRUNCATE_STATES=1 to read only its first {e.max_state:,} tokens (responses then say truncated: true)" if state else ""))
@@ -148,8 +161,8 @@ class Server:
         self.queue.put((enc, done))
         return done
 
-    def probs(self, rec):
-        return self.submit(rec).result()
+    def probs(self, rec, image=None):
+        return self.submit(rec, image).result()
 
     def _work(self):
         graphs = getattr(self.model, "graphs", None)
@@ -204,13 +217,22 @@ class Server:
     def answer(self, req):
         """The /v1/systemone response body for one request."""
         rec, meta = to_record(prepare(req))
-        return self._body(req, meta, *self.probs(rec))
+        return self._body(req, meta, *self.probs(rec, self.image(req)))
 
     async def answer_async(self, req):
         """answer() for the event loop: a request waiting on the model thread holds no worker thread, so a container takes
         as many concurrent requests as its batches can absorb (FastAPI runs sync endpoints on a 40-thread pool)."""
         rec, meta = to_record(prepare(req))
-        return self._body(req, meta, *await asyncio.wrap_future(self.submit(rec)))
+        image = self.image(req)   # a bad picture is a 422 for this request, before it joins a batch
+        return self._body(req, meta, *await asyncio.wrap_future(self.submit(rec, image)))
+
+    def image(self, req):
+        """The request's picture as a PIL image, or None. Only a model loaded with its vision tower (--vision) takes one."""
+        if req.image is None: return None
+        if not getattr(self.model, "accepts_images", False): raise HTTPException(422, "this server has no vision tower; start it with --vision to send an image")
+        from .vision import decode_image   # lazy: Pillow is only needed once an image arrives
+        try: return decode_image(req.image)
+        except ValueError as e: raise HTTPException(422, str(e))
 
     def _body(self, req, meta, ps, m):
         """The TypeSafe body. A server that may truncate (truncate_states) also says, on every response, whether it did:
@@ -222,6 +244,17 @@ class Server:
             body["usage"].update(state_tokens=m["state_tokens"], state_tokens_used=m["state_tokens_used"])
             body["truncated"] = m["state_tokens"] > m["state_tokens_used"]
         return body
+
+
+def read_request(path, image=None):
+    """A SystemOneRequest from a JSON file, for --request. Its `image` may also name a picture file (relative to the JSON
+    file), and `image` (a path) overrides it; files are inlined as base64, so Server.answer only ever sees image data."""
+    req = SystemOneRequest.model_validate_json(Path(path).read_text(encoding="utf-8"))
+    ref = req.image
+    if image: file = Path(image)
+    elif ref and not ref.startswith("data:") and len(ref) < 1024 and (Path(path).parent / ref).is_file(): file = Path(path).parent / ref
+    else: return req
+    return req.model_copy(update={"image": base64.b64encode(file.read_bytes()).decode()})
 
 
 def prepare(req):
@@ -308,7 +341,8 @@ def models():
     card = {"description": f"Kev pointer head on {meta.base}, serving {ck.requested} at temperature {s.model.head.temperature:.2f}",
             "release_date": s.release_date,
             "run": ck.requested, "base": meta.base, "lora": meta.lora, "device": s.device, "backend": s.model.backend, "dtype": s.model.dtype,
-            "temperature": s.model.head.temperature, "max_state_tokens": SERVE_MAX_STATE, "truncate_states": s.truncate_states,
+            "temperature": s.model.head.temperature, "images": getattr(s.model, "accepts_images", False),
+            "max_state_tokens": SERVE_MAX_STATE, "truncate_states": s.truncate_states,
             "cuda_graphs": graphs.stats() if (graphs := getattr(s.model, "graphs", None)) else None,
             "prefix_cache": {"size": s.prefix_cache.size, "min_state_tokens": s.prefix_cache.min_tokens, "max_tokens": s.prefix_cache.max_tokens, "hits": s.prefix_cache.hits,
                              "misses": s.prefix_cache.misses, "cached_states": len(s.prefix_cache.entries), "oom_retries": s.prefix_cache.oom_retries},
@@ -324,7 +358,13 @@ def main():
     ap.add_argument("--port", type=int, default=8008)
     ap.add_argument("--device", choices=("auto", *DEVICES), default="auto",
                     help="device to serve on; auto probes in a child process, cpu skips accelerator discovery")
+    ap.add_argument("--vision", action="store_true", help="load the base's vision tower too, so requests may carry an image (kev.vision; torch backend)")
+    ap.add_argument("--request", help="answer this SystemOneRequest JSON file, print the response and exit instead of serving")
+    ap.add_argument("--image", help="with --request: a picture file for the request, overriding the file's own image")
     a = ap.parse_args()
+    if a.image and not a.request: ap.error("--image needs --request")
+    req = read_request(a.request, a.image) if a.request else None
+    vision = a.vision or (req is not None and req.image is not None)
     run = a.run if is_hub_id(a.run) or os.path.exists(f"{a.run}/head.pt") else a.fallback
     if run != a.run: print(f"{a.run} not found, falling back to {run}")
     opts = LoadOptions.from_env()
@@ -339,9 +379,14 @@ def main():
     if fused_default: opts = replace(opts, fused=fused_available())   # serving default: fused Qwen3.5 kernels, ~1/3 less GPU time per batch (kev.fused_qwen35), when fla is installed; KEV_FUSED=0 to decline, KEV_FUSED=1 to insist
     if opts.backend is None: opts = replace(opts, backend="auto")   # serving default: MLX for the hybrid Qwen3.5 checkpoints on Apple Silicon (LoadOptions.backend); KEV_BACKEND=torch to decline
     ck = Checkpoint(run)
-    tok, model = ck.load(dev, opts)
+    tok, model = ck.load_vision(dev, opts) if vision else ck.load(dev, opts)
     if fused_default and not opts.fused and model.hybrid: print("fused Qwen3.5 kernels off: install the flash-linear-attention version kev/fused_qwen35.py pins (FLA_VERSION) to turn them on")
     app.state.server = Server(ck, tok, model, dev)
+    if req is not None:
+        try: print(json.dumps(app.state.server.answer(req), indent=2))
+        except HTTPException as e: sys.exit(f"error: {e.detail}")
+        finally: app.state.server.close()
+        return
     print(f"serving {ck.requested} ({ck.path}) on {dev} via {model.backend} ({model.dtype}) {a.host}:{a.port}; states over {SERVE_MAX_STATE:,} tokens "
           f"{'truncated (KEV_TRUNCATE_STATES=1)' if app.state.server.truncate_states else 'refused (422)'}")   # /v1/models reports the run as given, not the resolved cache path
     import uvicorn

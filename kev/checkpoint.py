@@ -13,6 +13,7 @@ import the data or suite modules at import time.
 
     ck = Checkpoint("jaredpalmer/kev-4b")          # or a local run directory; `@tag` pins a Hub revision
     tok, model = ck.load("mps", LoadOptions.from_env())
+    tok, model = ck.load_vision("cuda")             # the same checkpoint with an image in the state (kev.vision)
     ck.meta.temperature                             # the calibration the checkpoint carries
 """
 import datetime
@@ -271,7 +272,7 @@ class Checkpoint:
             merge_lora(lm, self.path, opts.lora_scale)
         return MLXDecisionModel(lm, pad_id(tok), head_dim=self.meta.head_dim)
 
-    def _load_torch(self, tok, device, opts):
+    def _load_torch(self, tok, device, opts, cls=DecisionModel):
         ascend = None
         if str(device).startswith("npu") and opts.npu_kernels:
             # Ascend has no flash-linear-attention, so transformers runs the Gated DeltaNet in a slow fp32 Python loop.
@@ -283,7 +284,7 @@ class Checkpoint:
                 ascend = npu_qwen35
             except Exception as e:
                 warnings.warn(f"kev.npu_qwen35 unavailable ({e}); the Gated DeltaNet runs the slow reference path")
-        m, merged = self._full_torch(tok, device, opts) if self.full else self._adapted_torch(tok, device, opts)
+        m, merged = self._full_torch(tok, device, opts, cls=cls) if self.full else self._adapted_torch(tok, device, opts, cls=cls)
         cuda = str(device).startswith("cuda")
         if opts.fused and m.hybrid and merged:   # fused projections need plain (merged or full) weights
             if ascend is not None:
@@ -295,7 +296,7 @@ class Checkpoint:
             from .cuda_graphs import CudaGraphs
             m.graphs = CudaGraphs(m.lm, m.pad_id)
         if ascend is not None and m.hybrid:
-            ascend.accelerate(m.lm)
+            ascend.accelerate(m.lm)   # language model, including the one inside a VisionDecisionModel
         return m
 
     SAVED_DTYPES = {"bf16": "bfloat16", "fp32": "float32"}   # head.pt weights_dtype -> the dtype save_pretrained writes to config.json
@@ -311,15 +312,19 @@ class Checkpoint:
             raise ValueError(f"{self.path}: config.json records the weights as {saved} but head.pt says weights_dtype={self.meta.weights_dtype!r}")
         return expected
 
-    def _full_torch(self, tok, device, opts):
+    def _full_torch(self, tok, device, opts, cls=DecisionModel):
         """-> (model, True). Full weights load in `saved_dtype`; an explicit dtype still casts on purpose (fp32: the same
-        values computed in fp32). Nothing to merge (`load` refuses lora_scale for full weights on either backend)."""
+        values computed in fp32). Nothing to merge (`load` refuses lora_scale for full weights on either backend).
+        `cls` is DecisionModel. A vision load needs the base's tower plus an adapter, which a full-weight directory does not have."""
+        if cls is not DecisionModel:
+            raise ValueError(f"{self.path} is a full-weight checkpoint; images need a LoRA adapter on the base's vision-language model")
         meta = self.meta
-        return DecisionModel(meta.base, tok, device, head_dim=meta.head_dim, option_isolation=meta.option_isolation,
-                             dtype=opts.dtype or getattr(torch, self.saved_dtype()), attn=opts.attn, weights=self.path), True
+        return cls(meta.base, tok, device, head_dim=meta.head_dim, option_isolation=meta.option_isolation,
+                   dtype=opts.dtype or getattr(torch, self.saved_dtype()), attn=opts.attn, weights=self.path), True
 
-    def _adapted_torch(self, tok, device, opts):
-        """-> (model, whether the adapter was merged): the base with this checkpoint's LoRA."""
+    def _adapted_torch(self, tok, device, opts, cls=DecisionModel):
+        """-> (model, whether the adapter was merged): the base with this checkpoint's LoRA. `cls` is DecisionModel, or
+        VisionDecisionModel when the state may start with an image."""
         from peft import PeftModel
         meta = self.meta
         dtype, merge = opts.dtype or torch.float32, opts.merge
@@ -329,8 +334,8 @@ class Checkpoint:
             # (one rounding of W + delta, as for every served Kev; parity in runs/serving-27b-*).
             dtype, merge = torch.bfloat16, merge and bool(opts.fused)
         merge = merge and not self.adapter_config().get("trainable_token_indices")   # token-trained adapters stay unmerged
-        m = DecisionModel(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
-                          option_isolation=meta.option_isolation, dtype=dtype, attn=opts.attn)
+        m = cls(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
+                option_isolation=meta.option_isolation, dtype=dtype, attn=opts.attn)
         m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(device)).to(device)   # trainable token embeddings, if any, live in the adapter
         if opts.lora_scale != 1:
             for module in m.lm.modules():
@@ -338,8 +343,24 @@ class Checkpoint:
                     for k in module.scaling: module.scaling[k] *= opts.lora_scale
             m.lora_scale = opts.lora_scale
         if merge: m.lm = m.lm.merge_and_unload()     # W += delta: fp32 math, one rounding (see LoadOptions.merge)
-        if dtype != torch.float32: m.lm = m.lm.to(dtype)
+        if dtype != torch.float32:
+            m.lm = m.lm.to(dtype)
+            visual = getattr(getattr(m, "vlm", None), "visual", None)
+            if visual is not None: visual.to(dtype)   # the tower is not under m.lm; leave it in the serving dtype too
         return m, merge
+
+    def load_vision(self, device, opts=LoadOptions()):
+        """-> (tokenizer, kev.vision.VisionDecisionModel) in eval mode: the same adapter and pointer head on the language
+        model inside the base's vision-language model, so a record's state can start with an image. Torch only: "auto"
+        resolves to torch, any other backend is refused (MLX loads mlx-lm's text model)."""
+        from .vision import VisionDecisionModel   # lazy: the Space vendors this module without kev/vision.py
+        if opts.backend not in (None, "torch", "auto"): raise ValueError(f"images run on the torch backend, not {opts.backend!r}")
+        meta = self.meta
+        tok = load_tokenizer(meta.base, revision=meta.base_revision)
+        m = self._load_torch(tok, device, opts, cls=VisionDecisionModel)
+        m.head.load_state_dict(meta.head); m.eval()
+        m.head.temperature = meta.temperature if opts.temperature is None else opts.temperature
+        return tok, m
 
     COMPAT_FIELDS = ("base", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings", "weights")
 
